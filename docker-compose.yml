@@ -1,0 +1,39 @@
+services:
+  tunnel-server:
+    image: ghcr.io/${GITHUB_REPO}:latest
+    container_name: mytunnel-server
+    restart: always
+    ports:
+      - "9000:9000"
+    expose:
+      - "8080"
+    environment:
+      - TUNNEL_DOMAIN=${TUNNEL_DOMAIN}
+      - TUNNEL_PORT=9000
+      - HTTP_PORT=8080
+    networks:
+      - tunnel-net
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: mytunnel-caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - tunnel-server
+    networks:
+      - tunnel-net
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  tunnel-net:
+    driver: bridge

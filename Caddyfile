@@ -1,0 +1,17 @@
+{
+	email {$ACME_EMAIL}
+}
+
+*.{$TUNNEL_DOMAIN} {
+	reverse_proxy tunnel-server:8080
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+}
+
+{$TUNNEL_DOMAIN} {
+	reverse_proxy tunnel-server:8080
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+}

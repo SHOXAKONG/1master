@@ -1,0 +1,8 @@
+.git
+.github
+.env
+.env.example
+client/
+README.md
+*.md
+ 
