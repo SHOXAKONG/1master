@@ -1,0 +1,83 @@
+name: Build tunnel-server image
+
+# On push to main: rebuild and push :latest + :sha-XXX, then poke the backend
+# repo to redeploy. Versioned releases (and binaries) live in release.yml.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-tunnel-server
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/1master-tunnel-server
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build & push tunnel-server
+    runs-on: ubuntu-latest
+    outputs:
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - id: meta
+        run: |
+          echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.name }}:latest
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.sha_tag }}
+          cache-from: type=gha,scope=tunnel-server
+          cache-to: type=gha,mode=max,scope=tunnel-server
+
+  deploy:
+    name: Restart tunnel-server on VPS
+    runs-on: ubuntu-latest
+    needs: image
+    environment: production
+    steps:
+      - name: Pull + restart tunnel-server
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          TUNNEL_TAG: ${{ needs.image.outputs.sha_tag }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          envs: TUNNEL_TAG
+          script: |
+            set -e
+            cd ${{ secrets.DEPLOY_PATH || '/opt/1master' }}
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            sed -i "/^TUNNEL_IMAGE_TAG=/d" .env
+            echo "TUNNEL_IMAGE_TAG=${TUNNEL_TAG}" >> .env
+            docker compose pull tunnel-server
+            docker compose up -d tunnel-server
+            docker image prune -f

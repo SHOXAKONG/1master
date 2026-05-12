@@ -6,15 +6,26 @@
 #   curl -fsSL https://1master.uz/install.sh | sh -s -- --version 0.1.0
 #
 # Env vars:
-#   ONEMASTER_BASE     base URL for downloads (default: https://1master.uz/dl)
-#   ONEMASTER_PREFIX   install dir            (default: /usr/local/bin)
-#   ONEMASTER_VERSION  version to install     (default: latest)
+#   ONEMASTER_REPO     GitHub repo  (default: shohruh/1master — change for forks)
+#   ONEMASTER_BASE     base URL     (overrides REPO; e.g. https://1master.uz/dl)
+#   ONEMASTER_PREFIX   install dir  (default: /usr/local/bin)
+#   ONEMASTER_VERSION  version      (default: latest)
 
 set -eu
 
-BASE="${ONEMASTER_BASE:-https://1master.uz/dl}"
+REPO="${ONEMASTER_REPO:-SHOXAKONG/1master}"
 PREFIX="${ONEMASTER_PREFIX:-/usr/local/bin}"
 VERSION="${ONEMASTER_VERSION:-latest}"
+
+# If ONEMASTER_BASE is set, that wins (legacy / self-hosted hosting).
+# Otherwise build the URL from GitHub Releases.
+if [ -n "${ONEMASTER_BASE:-}" ]; then
+  BASE="$ONEMASTER_BASE"
+elif [ "$VERSION" = "latest" ]; then
+  BASE="https://github.com/$REPO/releases/latest/download"
+else
+  BASE="https://github.com/$REPO/releases/download/v$VERSION"
+fi
 
 # Allow --version flag for convenience.
 while [ $# -gt 0 ]; do
@@ -22,6 +33,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION="$2"; shift 2 ;;
     --prefix)  PREFIX="$2";  shift 2 ;;
     --base)    BASE="$2";    shift 2 ;;
+    --repo)    REPO="$2";    shift 2 ;;
     *) echo "Unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -43,11 +55,7 @@ case "$arch" in
 esac
 
 # ---- pick URL ----
-if [ "$VERSION" = "latest" ]; then
-  URL="$BASE/1master-$OS-$ARCH"
-else
-  URL="$BASE/v$VERSION/1master-$OS-$ARCH"
-fi
+URL="$BASE/1master-$OS-$ARCH"
 
 # ---- pick downloader ----
 if command -v curl >/dev/null 2>&1; then
