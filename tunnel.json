@@ -1,8 +1,5 @@
 {
   "server": "localhost:9000",
-  "tunnels": [
-    { "subdomain": "frontend", "port": 3000 },
-    { "subdomain": "api", "port": 8000 },
-    { "subdomain": "admin", "port": 5173 }
-  ]
+  "token": "PASTE_YOUR_SERVICE_TOKEN_HERE",
+  "port": 3000
 }

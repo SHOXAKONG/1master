@@ -19,9 +19,10 @@ const (
 // Message is the wire format for all communication
 type Message struct {
 	Type      uint8  `json:"type"`
-	ID        string `json:"id,omitempty"` // request ID for matching req/resp
-	Subdomain string `json:"subdomain,omitempty"`
-	Data      []byte `json:"data,omitempty"` // HTTP request or response bytes
+	ID        string `json:"id,omitempty"`        // request ID for matching req/resp
+	Subdomain string `json:"subdomain,omitempty"` // requested subdomain (register) / assigned (resp)
+	Token     string `json:"token,omitempty"`     // service token (register only)
+	Data      []byte `json:"data,omitempty"`      // HTTP request or response bytes
 	Error     string `json:"error,omitempty"`
 }
 

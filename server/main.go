@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +22,8 @@ import (
 // Tunnel represents an active client tunnel
 type Tunnel struct {
 	Subdomain string
+	UserID    string
+	UserEmail string
 	Conn      net.Conn
 	Pending   map[string]chan *protocol.Message // waiting for responses by request ID
 	mu        sync.Mutex
@@ -26,30 +31,71 @@ type Tunnel struct {
 
 // Server manages all active tunnels
 type Server struct {
-	tunnels map[string]*Tunnel // subdomain -> tunnel
-	mu      sync.RWMutex
-	domain  string
+	tunnels  map[string]*Tunnel // subdomain -> tunnel
+	mu       sync.RWMutex
+	domain   string
+	authURL  string
+	authHTTP *http.Client
 }
 
-func NewServer(domain string) *Server {
+func NewServer(domain, authURL string) *Server {
 	return &Server{
 		tunnels: make(map[string]*Tunnel),
 		domain:  domain,
+		authURL: authURL,
+		authHTTP: &http.Client{
+			Timeout: 5 * time.Second,
+		},
 	}
 }
 
-// generateSubdomain creates a random subdomain
-func generateSubdomain() string {
-	words := []string{
-		"red", "blue", "green", "fast", "cool", "wild", "bold", "calm",
-		"dark", "fire", "gold", "ice", "jade", "keen", "lime", "moon",
+// authResponse mirrors backend's TunnelAuthResponse
+type authResponse struct {
+	UserID    string `json:"user_id"`
+	Email     string `json:"email"`
+	Username  string `json:"username"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+}
+
+// verifyToken calls the backend to validate a service token.
+// Returns (user info, nil) on success, or (nil, error) with a human-readable reason.
+func (s *Server) verifyToken(token string) (*authResponse, error) {
+	if s.authURL == "" {
+		return nil, fmt.Errorf("server misconfigured: BACKEND_AUTH_URL not set")
 	}
-	nouns := []string{
-		"fox", "owl", "wolf", "bear", "hawk", "lion", "deer", "crow",
-		"fish", "frog", "hare", "lynx", "moth", "newt", "seal", "wren",
+	if token == "" {
+		return nil, fmt.Errorf("missing token")
 	}
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	return fmt.Sprintf("%s-%s-%04d", words[r.Intn(len(words))], nouns[r.Intn(len(nouns))], r.Intn(10000))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.authURL, bytes.NewReader(nil))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.authHTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("auth backend unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("invalid or expired token")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("auth backend returned %d", resp.StatusCode)
+	}
+
+	var out authResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode auth response: %w", err)
+	}
+	return &out, nil
 }
 
 // generateRequestID creates a unique request ID
@@ -74,14 +120,36 @@ func (s *Server) handleTunnelConn(conn net.Conn) {
 		return
 	}
 
-	// Assign subdomain
-	subdomain := msg.Subdomain
-	if subdomain == "" {
-		subdomain = generateSubdomain()
+	// Verify the client's service token against the backend
+	auth, err := s.verifyToken(msg.Token)
+	if err != nil {
+		log.Printf("[tunnel] auth failed (%s): %v", conn.RemoteAddr(), err)
+		protocol.Send(conn, &protocol.Message{
+			Type:  protocol.TypeRegisterResp,
+			Error: "unauthorized: " + err.Error(),
+		})
+		return
+	}
+
+	// Subdomain is ALWAYS the authenticated user's username.
+	// If the client asked for a different one, log and override.
+	if auth.Username == "" {
+		log.Printf("[tunnel] backend returned empty username for user=%s", auth.Email)
+		protocol.Send(conn, &protocol.Message{
+			Type:  protocol.TypeRegisterResp,
+			Error: "server misconfigured: no username assigned to your account",
+		})
+		return
+	}
+	subdomain := auth.Username
+	if msg.Subdomain != "" && msg.Subdomain != subdomain {
+		log.Printf("[tunnel] client requested '%s' but using username '%s'", msg.Subdomain, subdomain)
 	}
 
 	tunnel := &Tunnel{
 		Subdomain: subdomain,
+		UserID:    auth.UserID,
+		UserEmail: auth.Email,
 		Conn:      conn,
 		Pending:   make(map[string]chan *protocol.Message),
 	}
@@ -100,7 +168,7 @@ func (s *Server) handleTunnelConn(conn net.Conn) {
 	s.mu.Unlock()
 
 	url := fmt.Sprintf("http://%s.%s", subdomain, s.domain)
-	log.Printf("[tunnel] registered: %s", url)
+	log.Printf("[tunnel] registered: %s (user=%s)", url, auth.Email)
 
 	// Send success response
 	protocol.Send(conn, &protocol.Message{
@@ -113,7 +181,7 @@ func (s *Server) handleTunnelConn(conn net.Conn) {
 		s.mu.Lock()
 		delete(s.tunnels, subdomain)
 		s.mu.Unlock()
-		log.Printf("[tunnel] disconnected: %s", subdomain)
+		log.Printf("[tunnel] disconnected: %s (user=%s)", subdomain, auth.Email)
 	}()
 
 	for {
@@ -269,7 +337,12 @@ func main() {
 		httpPort = "8080"
 	}
 
-	server := NewServer(domain)
+	authURL := os.Getenv("BACKEND_AUTH_URL")
+	if authURL == "" {
+		authURL = "http://localhost:8000/api/v1/tunnel/auth"
+	}
+
+	server := NewServer(domain, authURL)
 
 	// Start tunnel listener (TCP for client connections)
 	go func() {
@@ -292,6 +365,7 @@ func main() {
 	// Start HTTP server (for public traffic)
 	log.Printf("🌐 HTTP server on :%s", httpPort)
 	log.Printf("📡 Domain: %s", domain)
+	log.Printf("🔐 Auth backend: %s", authURL)
 	log.Printf("")
 	log.Printf("Clients connect to :%s, public traffic comes in on :%s", tunnelPort, httpPort)
 

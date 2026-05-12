@@ -10,103 +10,225 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"mytunnel/protocol"
 )
 
-// TunnelConfig represents a single tunnel mapping
-type TunnelConfig struct {
-	Subdomain string `json:"subdomain"`
-	Port      int    `json:"port"`
-}
+const (
+	defaultServer     = "localhost:9000"
+	defaultConfigPath = "" // empty == don't read
+)
 
-// Config is the client configuration
+// Config is the persistent client configuration (single tunnel per token).
 type Config struct {
-	Server  string         `json:"server"`
-	Tunnels []TunnelConfig `json:"tunnels"`
+	Server string `json:"server,omitempty"`
+	Token  string `json:"token,omitempty"`
 }
 
 func main() {
-	configFile := flag.String("config", "", "Path to config file (JSON)")
-	serverAddr := flag.String("server", "localhost:9000", "Tunnel server address")
-	localPort := flag.Int("port", 3000, "Local port to expose")
-	subdomain := flag.String("subdomain", "", "Static subdomain (required)")
-	flag.Parse()
+	log.SetFlags(log.Ltime)
 
-	// If config file provided, use it for multiple tunnels
-	if *configFile != "" {
-		runFromConfig(*configFile)
+	if len(os.Args) < 2 {
+		printUsageAndExit()
+	}
+
+	switch os.Args[1] {
+	case "http":
+		runHTTP(os.Args[2:])
+	case "auth":
+		runAuth(os.Args[2:])
+	case "help", "-h", "--help":
+		printUsage(os.Stdout)
+		os.Exit(0)
+	case "version", "-v", "--version":
+		fmt.Println("1master client v0.1.0")
+		os.Exit(0)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %q\n\n", os.Args[1])
+		printUsageAndExit()
+	}
+}
+
+func runAuth(args []string) {
+	if len(args) == 0 {
+		cfg := loadConfigFile("")
+		if cfg.Token == "" {
+			fmt.Println("Not authenticated.")
+			fmt.Println("Run: 1master auth <your-token>")
+			os.Exit(1)
+		}
+		fmt.Printf("✅ Authenticated (token: %s…%s)\n", cfg.Token[:6], cfg.Token[len(cfg.Token)-4:])
 		return
 	}
-
-	// Single tunnel mode
-	if *subdomain == "" {
-		fmt.Println("⚠️  No subdomain specified. Use -subdomain to set a static one.")
-		fmt.Println("   Example: go run . -subdomain myapp -port 3000")
-		fmt.Println("   Or use a config file for multiple tunnels:")
-		fmt.Println("   go run . -config tunnels.json")
-		fmt.Println()
+	if len(args) > 1 {
+		fmt.Fprintln(os.Stderr, "Usage: 1master auth <token>")
+		os.Exit(2)
+	}
+	token := strings.TrimSpace(args[0])
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "Empty token.")
+		os.Exit(2)
 	}
 
-	localAddr := fmt.Sprintf("localhost:%d", *localPort)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("Could not resolve home directory: %v", err)
+	}
+	dir := home + "/.1master"
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Fatalf("Could not create %s: %v", dir, err)
+	}
+	path := dir + "/config.json"
+
+	// Preserve any existing server setting; just update the token.
+	existing := loadConfigFile(path)
+	existing.Token = token
+
+	data, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		log.Fatalf("Could not encode config: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		log.Fatalf("Could not write %s: %v", path, err)
+	}
+	fmt.Printf("✅ Auth token saved to %s\n", path)
+	fmt.Println("Now run: 1master http <port>")
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprint(w, `1master — expose a local port at <username>.1master.uz
+
+USAGE:
+  1master http <port> [flags]
+
+EXAMPLES:
+  1master http 8000
+  1master http 3000 --token YOUR_TOKEN
+  1master http 8080 --server tunnel.1master.uz:9000
+
+FLAGS:
+  --token   <token>   Service token. Falls back to MYTUNNEL_TOKEN env var
+                      or ~/.1master/config.json.
+  --server  <addr>    Tunnel server address (default: localhost:9000).
+  --config  <path>    Path to JSON config file (default: ~/.1master/config.json).
+
+COMMANDS:
+  http       Start an HTTP tunnel for a local port.
+  auth       Save your service token to ~/.1master/config.json.
+  version    Print client version.
+  help       Show this message.
+`)
+}
+
+func printUsageAndExit() {
+	printUsage(os.Stderr)
+	os.Exit(2)
+}
+
+func runHTTP(args []string) {
+	fs := flag.NewFlagSet("http", flag.ExitOnError)
+	fs.Usage = func() { printUsage(os.Stderr) }
+	token := fs.String("token", "", "Service token (or set MYTUNNEL_TOKEN)")
+	serverAddr := fs.String("server", "", "Tunnel server address")
+	configPath := fs.String("config", "", "Config file path (default ~/.1master/config.json)")
+
+	// Positional port must come before flags (ngrok-style): `1master http 8000 --token X`.
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "❌ Missing port. Usage: 1master http <port>")
+		os.Exit(2)
+	}
+	portArg := args[0]
+	port, err := strconv.Atoi(portArg)
+	if err != nil || port <= 0 || port > 65535 {
+		fmt.Fprintf(os.Stderr, "❌ Invalid port %q. Must be 1–65535.\n", portArg)
+		os.Exit(2)
+	}
+	if err := fs.Parse(args[1:]); err != nil {
+		os.Exit(2)
+	}
+
+	// Resolve config: flag > env > config-file > default.
+	fileCfg := loadConfigFile(*configPath)
+
+	resolvedServer := firstNonEmpty(*serverAddr, fileCfg.Server, defaultServer)
+	resolvedToken := firstNonEmpty(*token, os.Getenv("MYTUNNEL_TOKEN"), fileCfg.Token)
+
+	if resolvedToken == "" {
+		fmt.Fprint(os.Stderr, `❌ Missing service token.
+
+Provide it via one of:
+  --token <token>
+  MYTUNNEL_TOKEN environment variable
+  ~/.1master/config.json   ({"token": "..."})
+`)
+		os.Exit(2)
+	}
+
+	localAddr := fmt.Sprintf("localhost:%d", port)
+
+	fmt.Println()
+	fmt.Println("╔══════════════════════════════════════════════════╗")
+	fmt.Println("║              🚇 1master Client                  ║")
+	fmt.Println("╠══════════════════════════════════════════════════╣")
+	fmt.Printf("║  Server:    %s\n", resolvedServer)
+	fmt.Printf("║  Forwards:  %s\n", localAddr)
+	fmt.Println("║  Subdomain: <your-username>.1master.uz           ║")
+	fmt.Println("╚══════════════════════════════════════════════════╝")
+	fmt.Println()
 
 	for {
-		if err := runTunnel(*serverAddr, localAddr, *subdomain); err != nil {
-			log.Printf("[%s] Connection lost: %v", *subdomain, err)
-			log.Printf("[%s] Reconnecting in 3 seconds...", *subdomain)
+		if err := runTunnel(resolvedServer, localAddr, resolvedToken); err != nil {
+			log.Printf("Connection lost: %v", err)
+			if isFatalAuthError(err) {
+				log.Printf("Auth error — not reconnecting.")
+				return
+			}
+			log.Printf("Reconnecting in 3 seconds...")
 			time.Sleep(3 * time.Second)
 		}
 	}
 }
 
-func runFromConfig(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		log.Fatalf("Failed to read config: %v", err)
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
 	}
-
-	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		log.Fatalf("Failed to parse config: %v", err)
-	}
-
-	if len(config.Tunnels) == 0 {
-		log.Fatal("No tunnels defined in config")
-	}
-
-	fmt.Println()
-	fmt.Println("╔══════════════════════════════════════════════════╗")
-	fmt.Println("║              🚇 MyTunnel Client                 ║")
-	fmt.Println("╠══════════════════════════════════════════════════╣")
-	for _, t := range config.Tunnels {
-		fmt.Printf("║  %s -> localhost:%d\n", t.Subdomain, t.Port)
-	}
-	fmt.Println("╚══════════════════════════════════════════════════╝")
-	fmt.Println()
-
-	var wg sync.WaitGroup
-	for _, t := range config.Tunnels {
-		wg.Add(1)
-		go func(tunnel TunnelConfig) {
-			defer wg.Done()
-			localAddr := fmt.Sprintf("localhost:%d", tunnel.Port)
-			for {
-				if err := runTunnel(config.Server, localAddr, tunnel.Subdomain); err != nil {
-					log.Printf("[%s] Connection lost: %v", tunnel.Subdomain, err)
-					log.Printf("[%s] Reconnecting in 3 seconds...", tunnel.Subdomain)
-					time.Sleep(3 * time.Second)
-				}
-			}
-		}(t)
-	}
-	wg.Wait()
+	return ""
 }
 
-func runTunnel(serverAddr, localAddr, subdomain string) error {
-	log.Printf("[%s] Connecting to %s...", subdomain, serverAddr)
+// loadConfigFile reads JSON config from `path` if given, else from
+// ~/.1master/config.json. Missing file is not an error.
+func loadConfigFile(path string) Config {
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return Config{}
+		}
+		path = home + "/.1master/config.json"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("Warning: ignoring malformed config %s: %v", path, err)
+		return Config{}
+	}
+	return cfg
+}
+
+func isFatalAuthError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "unauthorized")
+}
+
+func runTunnel(serverAddr, localAddr, token string) error {
+	log.Printf("Connecting to %s...", serverAddr)
 	conn, err := net.DialTimeout("tcp", serverAddr, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -114,8 +236,8 @@ func runTunnel(serverAddr, localAddr, subdomain string) error {
 	defer conn.Close()
 
 	err = protocol.Send(conn, &protocol.Message{
-		Type:      protocol.TypeRegister,
-		Subdomain: subdomain,
+		Type:  protocol.TypeRegister,
+		Token: token,
 	})
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
@@ -130,7 +252,7 @@ func runTunnel(serverAddr, localAddr, subdomain string) error {
 		return fmt.Errorf("registration failed: %s", resp.Error)
 	}
 
-	log.Printf("[%s] ✅ Online -> %s", resp.Subdomain, localAddr)
+	log.Printf("✅ Online: %s -> %s", resp.Subdomain, localAddr)
 
 	for {
 		msg, err := protocol.Recv(conn)
