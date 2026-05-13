@@ -17,10 +17,13 @@ import (
 	"mytunnel/protocol"
 )
 
-const (
-	defaultServer     = "localhost:9000"
-	defaultConfigPath = "" // empty == don't read
-)
+// defaultServer is overridable at build time via:
+//     go build -ldflags="-X main.defaultServer=1master.uz:9000"
+// so dev builds can stay pointed at localhost while release builds ship
+// pointed at production.
+var defaultServer = "1master.uz:9000"
+
+const defaultConfigPath = "" // empty == don't read
 
 // Config is the persistent client configuration (single tunnel per token).
 type Config struct {
@@ -112,7 +115,7 @@ EXAMPLES:
 FLAGS:
   --token   <token>   Service token. Falls back to MYTUNNEL_TOKEN env var
                       or ~/.1master/config.json.
-  --server  <addr>    Tunnel server address (default: localhost:9000).
+  --server  <addr>    Tunnel server address (default: 1master.uz:9000).
   --config  <path>    Path to JSON config file (default: ~/.1master/config.json).
 
 COMMANDS:
