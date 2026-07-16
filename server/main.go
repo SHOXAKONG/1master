@@ -1,55 +1,68 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
 	"mytunnel/protocol"
 )
 
-// Tunnel represents an active client tunnel
+// pendingConnTTL bounds how long a public connection waits for the client to
+// dial the data port and pair with it before we give up.
+const pendingConnTTL = 10 * time.Second
+
+// Tunnel is one client's live control connection, addressed by subdomain.
 type Tunnel struct {
 	Subdomain string
-	UserID    string
 	UserEmail string
-	Conn      net.Conn
-	Pending   map[string]chan *protocol.Message // waiting for responses by request ID
-	mu        sync.Mutex
+	control   *protocol.SafeConn
 }
 
-// Server manages all active tunnels
+// pendingConn is a public connection waiting to be paired with a client-dialed
+// data connection.
+type pendingConn struct {
+	pub     net.Conn
+	initial []byte  // bytes already read from pub while sniffing the Host header
+	tunnel  *Tunnel // owning tunnel, so we can drop it if the client disconnects
+}
+
+// Server owns the three planes: control, public, and data.
 type Server struct {
-	tunnels  map[string]*Tunnel // subdomain -> tunnel
-	mu       sync.RWMutex
 	domain   string
+	dataPort string
 	authURL  string
 	authHTTP *http.Client
+
+	mu      sync.RWMutex
+	tunnels map[string]*Tunnel // subdomain -> tunnel
+
+	pmu     sync.Mutex
+	pending map[string]*pendingConn // conn id -> waiting public connection
 }
 
-func NewServer(domain, authURL string) *Server {
+func NewServer(domain, dataPort, authURL string) *Server {
 	return &Server{
-		tunnels: make(map[string]*Tunnel),
-		domain:  domain,
-		authURL: authURL,
-		authHTTP: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+		domain:   domain,
+		dataPort: dataPort,
+		authURL:  authURL,
+		authHTTP: &http.Client{Timeout: 5 * time.Second},
+		tunnels:  make(map[string]*Tunnel),
+		pending:  make(map[string]*pendingConn),
 	}
 }
 
-// authResponse mirrors backend's TunnelAuthResponse
+// authResponse mirrors the backend's TunnelAuthResponse.
 type authResponse struct {
 	UserID    string `json:"user_id"`
 	Email     string `json:"email"`
@@ -58,8 +71,7 @@ type authResponse struct {
 	LastName  string `json:"last_name"`
 }
 
-// verifyToken calls the backend to validate a service token.
-// Returns (user info, nil) on success, or (nil, error) with a human-readable reason.
+// verifyToken validates a service token against the backend.
 func (s *Server) verifyToken(token string) (*authResponse, error) {
 	if s.authURL == "" {
 		return nil, fmt.Errorf("server misconfigured: BACKEND_AUTH_URL not set")
@@ -98,68 +110,51 @@ func (s *Server) verifyToken(token string) (*authResponse, error) {
 	return &out, nil
 }
 
-// generateRequestID creates a unique request ID
-func generateRequestID() string {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), r.Intn(100000))
-}
+// ---------------- Control plane ----------------
 
-// handleTunnelConn handles a new tunnel client connection
-func (s *Server) handleTunnelConn(conn net.Conn) {
-	defer conn.Close()
+// handleControlConn authenticates a client, registers its tunnel, and then
+// pushes new-connection events until the control connection closes.
+func (s *Server) handleControlConn(rawConn net.Conn) {
+	defer rawConn.Close()
+	conn := protocol.NewSafeConn(rawConn)
 
-	// Wait for registration message
 	msg, err := protocol.Recv(conn)
 	if err != nil {
-		log.Printf("[tunnel] failed to read registration: %v", err)
+		log.Printf("[control] read register failed (%s): %v", rawConn.RemoteAddr(), err)
 		return
 	}
-
 	if msg.Type != protocol.TypeRegister {
-		log.Printf("[tunnel] expected register, got type %d", msg.Type)
+		log.Printf("[control] expected register, got type %d", msg.Type)
 		return
 	}
 
-	// Verify the client's service token against the backend
 	auth, err := s.verifyToken(msg.Token)
 	if err != nil {
-		log.Printf("[tunnel] auth failed (%s): %v", conn.RemoteAddr(), err)
-		protocol.Send(conn, &protocol.Message{
-			Type:  protocol.TypeRegisterResp,
-			Error: "unauthorized: " + err.Error(),
-		})
+		log.Printf("[control] auth failed (%s): %v", rawConn.RemoteAddr(), err)
+		conn.Send(&protocol.Message{Type: protocol.TypeRegistered, Error: "unauthorized: " + err.Error()})
 		return
 	}
 
 	// Subdomain is ALWAYS the authenticated user's username.
-	// If the client asked for a different one, log and override.
-	if auth.Username == "" {
-		log.Printf("[tunnel] backend returned empty username for user=%s", auth.Email)
-		protocol.Send(conn, &protocol.Message{
-			Type:  protocol.TypeRegisterResp,
+	subdomain := auth.Username
+	if subdomain == "" {
+		conn.Send(&protocol.Message{
+			Type:  protocol.TypeRegistered,
 			Error: "server misconfigured: no username assigned to your account",
 		})
 		return
 	}
-	subdomain := auth.Username
 	if msg.Subdomain != "" && msg.Subdomain != subdomain {
-		log.Printf("[tunnel] client requested '%s' but using username '%s'", msg.Subdomain, subdomain)
+		log.Printf("[control] client requested '%s' but using username '%s'", msg.Subdomain, subdomain)
 	}
 
-	tunnel := &Tunnel{
-		Subdomain: subdomain,
-		UserID:    auth.UserID,
-		UserEmail: auth.Email,
-		Conn:      conn,
-		Pending:   make(map[string]chan *protocol.Message),
-	}
+	tunnel := &Tunnel{Subdomain: subdomain, UserEmail: auth.Email, control: conn}
 
-	// Register tunnel
 	s.mu.Lock()
 	if _, exists := s.tunnels[subdomain]; exists {
 		s.mu.Unlock()
-		protocol.Send(conn, &protocol.Message{
-			Type:  protocol.TypeRegisterResp,
+		conn.Send(&protocol.Message{
+			Type:  protocol.TypeRegistered,
 			Error: fmt.Sprintf("subdomain '%s' already in use", subdomain),
 		})
 		return
@@ -167,209 +162,233 @@ func (s *Server) handleTunnelConn(conn net.Conn) {
 	s.tunnels[subdomain] = tunnel
 	s.mu.Unlock()
 
-	url := fmt.Sprintf("http://%s.%s", subdomain, s.domain)
-	log.Printf("[tunnel] registered: %s (user=%s)", url, auth.Email)
-
-	// Send success response
-	protocol.Send(conn, &protocol.Message{
-		Type:      protocol.TypeRegisterResp,
+	hostname := fmt.Sprintf("%s.%s", subdomain, s.domain)
+	if err := conn.Send(&protocol.Message{
+		Type:      protocol.TypeRegistered,
 		Subdomain: subdomain,
-	})
+		Hostname:  hostname,
+		DataPort:  s.dataPort,
+	}); err != nil {
+		s.dropTunnel(tunnel)
+		return
+	}
+	log.Printf("[control] registered: http://%s (user=%s)", hostname, auth.Email)
 
-	// Read responses from client
+	// Tear everything down when the control connection goes away.
 	defer func() {
-		s.mu.Lock()
-		delete(s.tunnels, subdomain)
-		s.mu.Unlock()
-		log.Printf("[tunnel] disconnected: %s (user=%s)", subdomain, auth.Email)
+		s.dropTunnel(tunnel)
+		log.Printf("[control] disconnected: %s (user=%s)", subdomain, auth.Email)
 	}()
 
+	// The client never sends more control frames; this blocks until the
+	// connection closes, acting as a disconnect detector.
 	for {
-		msg, err := protocol.Recv(conn)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[tunnel] read error (%s): %v", subdomain, err)
-			}
+		if _, err := protocol.Recv(conn); err != nil {
 			return
-		}
-
-		if msg.Type == protocol.TypeProxyResp {
-			tunnel.mu.Lock()
-			ch, ok := tunnel.Pending[msg.ID]
-			if ok {
-				ch <- msg
-				delete(tunnel.Pending, msg.ID)
-			}
-			tunnel.mu.Unlock()
 		}
 	}
 }
 
-// ServeHTTP handles incoming public HTTP requests and routes them to tunnels
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Extract subdomain from Host header
-	host := r.Host
-	if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
-		host = host[:colonIdx]
+// dropTunnel removes a tunnel and closes any of its still-pending public
+// connections.
+func (s *Server) dropTunnel(t *Tunnel) {
+	s.mu.Lock()
+	if cur, ok := s.tunnels[t.Subdomain]; ok && cur == t {
+		delete(s.tunnels, t.Subdomain)
 	}
+	s.mu.Unlock()
 
-	// Get subdomain: everything before the first dot
-	subdomain := ""
-	if dotIdx := strings.Index(host, "."); dotIdx != -1 {
-		subdomain = host[:dotIdx]
+	s.pmu.Lock()
+	for id, p := range s.pending {
+		if p.tunnel == t {
+			p.pub.Close()
+			delete(s.pending, id)
+		}
 	}
+	s.pmu.Unlock()
+}
 
-	if subdomain == "" {
-		// Root domain - show status page
-		w.Header().Set("Content-Type", "text/html")
-		s.mu.RLock()
-		count := len(s.tunnels)
-		s.mu.RUnlock()
-		fmt.Fprintf(w, `<html><body style="font-family:monospace;padding:40px">
-			<h1>🚇 MyTunnel Server</h1>
-			<p>Active tunnels: %d</p>
-			<p>Usage: <code>mytunnel-client -server %s:9000 -port 3000</code></p>
-		</body></html>`, count, s.domain)
+// ---------------- Public plane ----------------
+
+// servePublicConn sniffs the Host header of an incoming public request, finds
+// the matching tunnel, parks the connection, and asks the client to dial back.
+func (s *Server) servePublicConn(pub net.Conn) {
+	_ = pub.SetReadDeadline(time.Now().Add(pendingConnTTL))
+	host, initial, err := parseHost(pub)
+	if err != nil || host == "" {
+		writeHTTPError(pub, http.StatusBadRequest, "Bad Request", "could not determine target host")
+		return
+	}
+	_ = pub.SetReadDeadline(time.Time{})
+
+	if host == s.domain {
+		s.writeStatusPage(pub)
 		return
 	}
 
-	// Find the tunnel
+	subdomain := subdomainOf(host)
 	s.mu.RLock()
 	tunnel, ok := s.tunnels[subdomain]
 	s.mu.RUnlock()
-
 	if !ok {
-		http.Error(w, fmt.Sprintf("Tunnel '%s' not found", subdomain), http.StatusNotFound)
+		writeHTTPError(pub, http.StatusNotFound, "Not Found", fmt.Sprintf("tunnel '%s' not found", subdomain))
 		return
 	}
 
-	// Serialize the HTTP request
-	reqID := generateRequestID()
-
-	// Build raw HTTP request to forward
-	var reqBuf strings.Builder
-	fmt.Fprintf(&reqBuf, "%s %s %s\r\n", r.Method, r.URL.RequestURI(), r.Proto)
-	fmt.Fprintf(&reqBuf, "Host: %s\r\n", r.Host)
-	for key, vals := range r.Header {
-		for _, val := range vals {
-			fmt.Fprintf(&reqBuf, "%s: %s\r\n", key, val)
-		}
-	}
-	fmt.Fprintf(&reqBuf, "X-Forwarded-For: %s\r\n", r.RemoteAddr)
-	fmt.Fprintf(&reqBuf, "\r\n")
-
-	// Read request body
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
-	reqBytes := append([]byte(reqBuf.String()), body...)
-
-	// Create response channel
-	respCh := make(chan *protocol.Message, 1)
-	tunnel.mu.Lock()
-	tunnel.Pending[reqID] = respCh
-	tunnel.mu.Unlock()
-
-	// Send to client
-	err := protocol.Send(tunnel.Conn, &protocol.Message{
-		Type: protocol.TypeProxy,
-		ID:   reqID,
-		Data: reqBytes,
-	})
+	id, err := newConnID()
 	if err != nil {
-		tunnel.mu.Lock()
-		delete(tunnel.Pending, reqID)
-		tunnel.mu.Unlock()
-		http.Error(w, "Tunnel connection error", http.StatusBadGateway)
+		writeHTTPError(pub, http.StatusInternalServerError, "Internal Server Error", "could not allocate connection")
 		return
 	}
 
-	// Wait for response with timeout
-	select {
-	case resp := <-respCh:
-		if resp.Error != "" {
-			http.Error(w, resp.Error, http.StatusBadGateway)
-			return
+	s.pmu.Lock()
+	s.pending[id] = &pendingConn{pub: pub, initial: initial, tunnel: tunnel}
+	s.pmu.Unlock()
+
+	// Reap the pending connection if the client never dials back.
+	time.AfterFunc(pendingConnTTL, func() {
+		if p := s.takePending(id); p != nil {
+			writeHTTPError(p.pub, http.StatusGatewayTimeout, "Gateway Timeout", "tunnel client did not respond")
 		}
-		// Parse the HTTP response from client
-		respReader := bufio.NewReader(strings.NewReader(string(resp.Data)))
-		httpResp, err := http.ReadResponse(respReader, r)
-		if err != nil {
-			// Fallback: write raw data
-			w.Header().Set("Content-Type", "text/html")
-			w.Write(resp.Data)
-			return
+	})
+
+	if err := tunnel.control.Send(&protocol.Message{Type: protocol.TypeNewConn, ConnID: id}); err != nil {
+		if p := s.takePending(id); p != nil {
+			writeHTTPError(p.pub, http.StatusBadGateway, "Bad Gateway", "tunnel client unavailable")
 		}
-		defer httpResp.Body.Close()
-
-		// Copy response headers
-		for key, vals := range httpResp.Header {
-			for _, val := range vals {
-				w.Header().Add(key, val)
-			}
-		}
-
-		// Write status code
-		w.WriteHeader(httpResp.StatusCode)
-
-		// Copy response body
-		io.Copy(w, httpResp.Body)
-
-	case <-time.After(30 * time.Second):
-		tunnel.mu.Lock()
-		delete(tunnel.Pending, reqID)
-		tunnel.mu.Unlock()
-		http.Error(w, "Tunnel timeout", http.StatusGatewayTimeout)
 	}
 }
 
-func main() {
-	domain := os.Getenv("TUNNEL_DOMAIN")
-	if domain == "" {
-		domain = "localhost"
+func (s *Server) writeStatusPage(conn net.Conn) {
+	s.mu.RLock()
+	count := len(s.tunnels)
+	s.mu.RUnlock()
+	body := fmt.Sprintf("1master tunnel server\nactive tunnels: %d\n", count)
+	fmt.Fprintf(conn,
+		"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		len(body), body)
+	conn.Close()
+}
+
+// ---------------- Data plane ----------------
+
+// serveDataConn pairs a client-dialed data connection with its waiting public
+// connection and pipes bytes between them.
+func (s *Server) serveDataConn(data net.Conn) {
+	idBytes := make([]byte, protocol.ConnIDSize)
+	_ = data.SetReadDeadline(time.Now().Add(pendingConnTTL))
+	if _, err := io.ReadFull(data, idBytes); err != nil {
+		data.Close()
+		return
+	}
+	_ = data.SetReadDeadline(time.Time{})
+
+	id := hex.EncodeToString(idBytes)
+	p := s.takePending(id)
+	if p == nil {
+		// Unknown/expired/duplicate id.
+		data.Close()
+		return
 	}
 
-	tunnelPort := os.Getenv("TUNNEL_PORT")
-	if tunnelPort == "" {
-		tunnelPort = "9000"
+	// Replay the bytes we already read from the public side so the client's
+	// local service receives the full, original request.
+	if len(p.initial) > 0 {
+		if _, err := data.Write(p.initial); err != nil {
+			p.pub.Close()
+			data.Close()
+			return
+		}
 	}
 
-	httpPort := os.Getenv("HTTP_PORT")
-	if httpPort == "" {
-		httpPort = "8080"
+	protocol.Bind(p.pub, data)
+}
+
+// takePending atomically removes and returns a pending connection.
+func (s *Server) takePending(id string) *pendingConn {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	p, ok := s.pending[id]
+	if !ok {
+		return nil
 	}
+	delete(s.pending, id)
+	return p
+}
 
-	authURL := os.Getenv("BACKEND_AUTH_URL")
-	if authURL == "" {
-		authURL = "http://localhost:8000/api/v1/tunnel/auth"
+// ---------------- Bootstrap ----------------
+
+func listen(port string, tlsCfg *tls.Config) (net.Listener, error) {
+	if tlsCfg != nil {
+		return tls.Listen("tcp", ":"+port, tlsCfg)
 	}
+	return net.Listen("tcp", ":"+port)
+}
 
-	server := NewServer(domain, authURL)
-
-	// Start tunnel listener (TCP for client connections)
-	go func() {
-		ln, err := net.Listen("tcp", ":"+tunnelPort)
+func acceptLoop(name string, ln net.Listener, handler func(net.Conn)) {
+	for {
+		conn, err := ln.Accept()
 		if err != nil {
-			log.Fatalf("failed to listen on tunnel port %s: %v", tunnelPort, err)
+			log.Printf("[%s] accept error: %v", name, err)
+			return
 		}
-		log.Printf("🔌 Tunnel listener on :%s", tunnelPort)
-
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				log.Printf("accept error: %v", err)
-				continue
-			}
-			go server.handleTunnelConn(conn)
-		}
-	}()
-
-	// Start HTTP server (for public traffic)
-	log.Printf("🌐 HTTP server on :%s", httpPort)
-	log.Printf("📡 Domain: %s", domain)
-	log.Printf("🔐 Auth backend: %s", authURL)
-	log.Printf("")
-	log.Printf("Clients connect to :%s, public traffic comes in on :%s", tunnelPort, httpPort)
-
-	if err := http.ListenAndServe(":"+httpPort, server); err != nil {
-		log.Fatalf("HTTP server error: %v", err)
+		go handler(conn)
 	}
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func main() {
+	domain := envOr("TUNNEL_DOMAIN", "localhost")
+	controlPort := envOr("TUNNEL_PORT", "9000")
+	dataPort := envOr("TUNNEL_DATA_PORT", "9001")
+	httpPort := envOr("HTTP_PORT", "8080")
+	authURL := envOr("BACKEND_AUTH_URL", "http://localhost:8000/api/v1/tunnel/auth")
+
+	// Optional TLS for the client<->server control and data links, so the
+	// service token and proxied traffic are not sent in cleartext.
+	var tlsCfg *tls.Config
+	tlsCert, tlsKey := os.Getenv("TUNNEL_TLS_CERT"), os.Getenv("TUNNEL_TLS_KEY")
+	if tlsCert != "" && tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
+		if err != nil {
+			log.Fatalf("failed to load TLS cert/key: %v", err)
+		}
+		tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
+
+	server := NewServer(domain, dataPort, authURL)
+
+	controlLn, err := listen(controlPort, tlsCfg)
+	if err != nil {
+		log.Fatalf("control listener on :%s: %v", controlPort, err)
+	}
+	dataLn, err := listen(dataPort, tlsCfg)
+	if err != nil {
+		log.Fatalf("data listener on :%s: %v", dataPort, err)
+	}
+	// Public traffic arrives from Caddy (which terminates TLS), so it is plain.
+	publicLn, err := net.Listen("tcp", ":"+httpPort)
+	if err != nil {
+		log.Fatalf("public listener on :%s: %v", httpPort, err)
+	}
+
+	tlsState := "plaintext — set TUNNEL_TLS_CERT/KEY to enable TLS"
+	if tlsCfg != nil {
+		tlsState = "TLS"
+	}
+	log.Printf("control :%s (%s)", controlPort, tlsState)
+	log.Printf("data    :%s (%s)", dataPort, tlsState)
+	log.Printf("public  :%s (plaintext, front with Caddy for TLS)", httpPort)
+	log.Printf("domain  %s", domain)
+	log.Printf("auth    %s", authURL)
+
+	go acceptLoop("control", controlLn, server.handleControlConn)
+	go acceptLoop("data", dataLn, server.serveDataConn)
+	acceptLoop("public", publicLn, server.servePublicConn)
 }

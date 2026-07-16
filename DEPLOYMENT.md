@@ -38,9 +38,9 @@ and a single VPS. Every command you need, in the order you run them.
    1master.uz           api.1master.uz         *.1master.uz
         ▼                     ▼                     ▼
     frontend             api + worker          tunnel-server
-                              │                  (+ TCP :9000
-                          postgres                publicly exposed)
-                            redis
+                              │                  (+ TCP :9000 control
+                          postgres                & :9001 data,
+                            redis                 publicly exposed)
 ```
 
 **Three repos**, each with its own `.github/workflows/`:
@@ -165,11 +165,12 @@ curl -fsSL https://get.docker.com | sh
 docker --version
 docker compose version
 
-# Open firewall for inbound 80, 443, 9000 (if you're using ufw)
+# Open firewall for inbound 80, 443, 9000, 9001 (if you're using ufw)
 ufw allow 22/tcp   2>/dev/null
 ufw allow 80/tcp   2>/dev/null
 ufw allow 443/tcp  2>/dev/null
 ufw allow 9000/tcp 2>/dev/null
+ufw allow 9001/tcp 2>/dev/null
 
 # Make the deploy directory
 mkdir -p /opt/1master/backend

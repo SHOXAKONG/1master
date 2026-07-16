@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bufio"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -17,8 +17,16 @@ import (
 	"mytunnel/protocol"
 )
 
+// tlsOptions controls whether the client dials the tunnel server over TLS.
+type tlsOptions struct {
+	enabled    bool
+	skipVerify bool
+}
+
 // defaultServer is overridable at build time via:
-//     go build -ldflags="-X main.defaultServer=1master.uz:9000"
+//
+//	go build -ldflags="-X main.defaultServer=1master.uz:9000"
+//
 // so dev builds can stay pointed at localhost while release builds ship
 // pointed at production.
 var defaultServer = "1master.uz:9000"
@@ -29,6 +37,7 @@ const defaultConfigPath = "" // empty == don't read
 type Config struct {
 	Server string `json:"server,omitempty"`
 	Token  string `json:"token,omitempty"`
+	TLS    bool   `json:"tls,omitempty"`
 }
 
 func main() {
@@ -117,6 +126,9 @@ FLAGS:
                       or ~/.1master/config.json.
   --server  <addr>    Tunnel server address (default: 1master.uz:9000).
   --config  <path>    Path to JSON config file (default: ~/.1master/config.json).
+  --tls               Dial the tunnel server over TLS (recommended in prod;
+                      can also be set with "tls": true in config.json).
+  --tls-skip-verify   Skip TLS certificate verification (self-signed servers).
 
 COMMANDS:
   http       Start an HTTP tunnel for a local port.
@@ -137,6 +149,8 @@ func runHTTP(args []string) {
 	token := fs.String("token", "", "Service token (or set MYTUNNEL_TOKEN)")
 	serverAddr := fs.String("server", "", "Tunnel server address")
 	configPath := fs.String("config", "", "Config file path (default ~/.1master/config.json)")
+	useTLS := fs.Bool("tls", false, "Dial the tunnel server over TLS")
+	tlsSkipVerify := fs.Bool("tls-skip-verify", false, "Skip TLS certificate verification (self-signed servers)")
 
 	// Positional port must come before flags (ngrok-style): `1master http 8000 --token X`.
 	if len(args) == 0 {
@@ -158,6 +172,10 @@ func runHTTP(args []string) {
 
 	resolvedServer := firstNonEmpty(*serverAddr, fileCfg.Server, defaultServer)
 	resolvedToken := firstNonEmpty(*token, os.Getenv("MYTUNNEL_TOKEN"), fileCfg.Token)
+	resolvedTLS := &tlsOptions{
+		enabled:    *useTLS || fileCfg.TLS,
+		skipVerify: *tlsSkipVerify,
+	}
 
 	if resolvedToken == "" {
 		fmt.Fprint(os.Stderr, `❌ Missing service token.
@@ -183,7 +201,7 @@ Provide it via one of:
 	fmt.Println()
 
 	for {
-		if err := runTunnel(resolvedServer, localAddr, resolvedToken); err != nil {
+		if err := runTunnel(resolvedServer, localAddr, resolvedToken, resolvedTLS); err != nil {
 			log.Printf("Connection lost: %v", err)
 			if isFatalAuthError(err) {
 				log.Printf("Auth error — not reconnecting.")
@@ -230,19 +248,33 @@ func isFatalAuthError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "unauthorized")
 }
 
-func runTunnel(serverAddr, localAddr, token string) error {
+// dial opens a TCP (or TLS) connection to addr.
+func dial(addr string, tlsCfg *tlsOptions) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if !tlsCfg.enabled {
+		return dialer.Dial("tcp", addr)
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: tlsCfg.skipVerify, //nolint:gosec // opt-in for self-signed servers
+	})
+}
+
+func runTunnel(serverAddr, localAddr, token string, tlsCfg *tlsOptions) error {
 	log.Printf("Connecting to %s...", serverAddr)
-	conn, err := net.DialTimeout("tcp", serverAddr, 10*time.Second)
+
+	rawConn, err := dial(serverAddr, tlsCfg)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer conn.Close()
+	defer rawConn.Close()
 
-	err = protocol.Send(conn, &protocol.Message{
-		Type:  protocol.TypeRegister,
-		Token: token,
-	})
-	if err != nil {
+	conn := protocol.NewSafeConn(rawConn)
+	if err := conn.Send(&protocol.Message{Type: protocol.TypeRegister, Token: token}); err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
 
@@ -250,98 +282,81 @@ func runTunnel(serverAddr, localAddr, token string) error {
 	if err != nil {
 		return fmt.Errorf("register response: %w", err)
 	}
-
 	if resp.Error != "" {
 		return fmt.Errorf("registration failed: %s", resp.Error)
 	}
 
-	log.Printf("✅ Online: %s -> %s", resp.Subdomain, localAddr)
+	// The client dials this address once per public request.
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		host = serverAddr
+	}
+	dataAddr := net.JoinHostPort(host, resp.DataPort)
+
+	log.Printf("✅ Online: https://%s -> %s", resp.Hostname, localAddr)
 
 	for {
 		msg, err := protocol.Recv(conn)
 		if err != nil {
 			return fmt.Errorf("recv: %w", err)
 		}
-
-		if msg.Type == protocol.TypeProxy {
-			go handleProxyRequest(conn, msg, localAddr)
+		if msg.Type == protocol.TypeNewConn {
+			go handleConn(dataAddr, localAddr, msg.ConnID, tlsCfg)
 		}
 	}
 }
 
-func handleProxyRequest(tunnelConn net.Conn, msg *protocol.Message, localAddr string) {
-	reader := bufio.NewReader(strings.NewReader(string(msg.Data)))
-	req, err := http.ReadRequest(reader)
-	if err != nil {
-		log.Printf("[%s] failed to parse request: %v", msg.ID, err)
-		sendError(tunnelConn, msg.ID, "Failed to parse request")
+// handleConn services one public request: it dials the local service and a
+// fresh data connection to the server, identifies itself, then pipes bytes
+// raw in both directions. No HTTP parsing happens here, so streaming and
+// WebSocket upgrades pass through untouched.
+func handleConn(dataAddr, localAddr, connID string, tlsCfg *tlsOptions) {
+	idBytes, err := hex.DecodeString(connID)
+	if err != nil || len(idBytes) != protocol.ConnIDSize {
+		log.Printf("[%s] invalid connection id", connID)
 		return
 	}
 
-	addrs := []string{localAddr}
-	port := localAddr[strings.LastIndex(localAddr, ":")+1:]
-	if strings.HasPrefix(localAddr, "localhost:") {
-		addrs = append(addrs, "127.0.0.1:"+port)
-	} else if strings.HasPrefix(localAddr, "127.0.0.1:") {
-		addrs = append(addrs, "localhost:"+port)
-	}
-
-	var localConn net.Conn
-	var connErr error
-	for _, addr := range addrs {
-		localConn, connErr = net.DialTimeout("tcp", addr, 5*time.Second)
-		if connErr == nil {
-			break
-		}
-	}
-	if connErr != nil {
-		log.Printf("[%s] local service unavailable on port %s: %v", msg.ID, port, connErr)
-		sendError(tunnelConn, msg.ID, fmt.Sprintf("Local service on port %s is not reachable", port))
+	localConn, err := dialLocal(localAddr)
+	if err != nil {
+		log.Printf("[%s] local service unreachable: %v", connID, err)
 		return
 	}
 	defer localConn.Close()
 
-	err = req.Write(localConn)
+	dataConn, err := dial(dataAddr, tlsCfg)
 	if err != nil {
-		log.Printf("[%s] failed to write to local: %v", msg.ID, err)
-		sendError(tunnelConn, msg.ID, "Failed to forward request")
+		log.Printf("[%s] data connect failed: %v", connID, err)
+		return
+	}
+	defer dataConn.Close()
+
+	if _, err := dataConn.Write(idBytes); err != nil {
+		log.Printf("[%s] failed to pair data connection: %v", connID, err)
 		return
 	}
 
-	localReader := bufio.NewReader(localConn)
-	resp, err := http.ReadResponse(localReader, req)
-	if err != nil {
-		log.Printf("[%s] failed to read local response: %v", msg.ID, err)
-		sendError(tunnelConn, msg.ID, "Failed to read response from local service")
-		return
-	}
-	defer resp.Body.Close()
-
-	var respBuf strings.Builder
-	fmt.Fprintf(&respBuf, "%s %s\r\n", resp.Proto, resp.Status)
-	for key, vals := range resp.Header {
-		for _, val := range vals {
-			fmt.Fprintf(&respBuf, "%s: %s\r\n", key, val)
-		}
-	}
-	fmt.Fprintf(&respBuf, "\r\n")
-
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
-	respBytes := append([]byte(respBuf.String()), bodyBytes...)
-
-	log.Printf("[%s] %s %s -> %s", msg.ID, req.Method, req.URL.Path, resp.Status)
-
-	protocol.Send(tunnelConn, &protocol.Message{
-		Type: protocol.TypeProxyResp,
-		ID:   msg.ID,
-		Data: respBytes,
-	})
+	protocol.Bind(localConn, dataConn)
 }
 
-func sendError(conn net.Conn, id, errMsg string) {
-	protocol.Send(conn, &protocol.Message{
-		Type:  protocol.TypeProxyResp,
-		ID:    id,
-		Error: errMsg,
-	})
+// dialLocal connects to the user's local service, trying the 127.0.0.1 /
+// localhost counterpart as a fallback.
+func dialLocal(localAddr string) (net.Conn, error) {
+	addrs := []string{localAddr}
+	if port := localAddr[strings.LastIndex(localAddr, ":")+1:]; port != localAddr {
+		if strings.HasPrefix(localAddr, "localhost:") {
+			addrs = append(addrs, "127.0.0.1:"+port)
+		} else if strings.HasPrefix(localAddr, "127.0.0.1:") {
+			addrs = append(addrs, "localhost:"+port)
+		}
+	}
+	var lastErr error
+	for _, addr := range addrs {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }

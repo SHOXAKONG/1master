@@ -4,13 +4,23 @@ services:
     container_name: mytunnel-server
     restart: always
     ports:
-      - "9000:9000"
+      - "9000:9000"  # control plane (client registers here)
+      - "9001:9001"  # data plane (client dials once per public request)
     expose:
       - "8080"
     environment:
       - TUNNEL_DOMAIN=${TUNNEL_DOMAIN}
       - TUNNEL_PORT=9000
+      - TUNNEL_DATA_PORT=9001
       - HTTP_PORT=8080
+      - BACKEND_AUTH_URL=${BACKEND_AUTH_URL}
+      # Optional: enable TLS on the control+data links so service tokens and
+      # proxied traffic are not sent in cleartext. Mount the cert/key and point
+      # these at them; clients then connect with `1master http <port> --tls`.
+      # - TUNNEL_TLS_CERT=/certs/fullchain.pem
+      # - TUNNEL_TLS_KEY=/certs/privkey.pem
+    # volumes:
+    #   - ./certs:/certs:ro
     networks:
       - tunnel-net
 
