@@ -135,17 +135,24 @@ func (s *Server) handleControlConn(rawConn net.Conn) {
 		return
 	}
 
-	// Subdomain is ALWAYS the authenticated user's username.
-	subdomain := auth.Username
-	if subdomain == "" {
+	username := auth.Username
+	if username == "" {
 		conn.Send(&protocol.Message{
 			Type:  protocol.TypeRegistered,
 			Error: "server misconfigured: no username assigned to your account",
 		})
 		return
 	}
-	if msg.Subdomain != "" && msg.Subdomain != subdomain {
-		log.Printf("[control] client requested '%s' but using username '%s'", msg.Subdomain, subdomain)
+
+	// A user may run several tunnels at once; each gets its own subdomain.
+	// No requested label -> the bare username; a label -> "<label>-<username>".
+	subdomain, err := effectiveSubdomain(username, msg.Subdomain)
+	if err != nil {
+		conn.Send(&protocol.Message{
+			Type:  protocol.TypeRegistered,
+			Error: "invalid subdomain: " + err.Error(),
+		})
+		return
 	}
 
 	tunnel := &Tunnel{Subdomain: subdomain, UserEmail: auth.Email, control: conn}
@@ -155,7 +162,7 @@ func (s *Server) handleControlConn(rawConn net.Conn) {
 		s.mu.Unlock()
 		conn.Send(&protocol.Message{
 			Type:  protocol.TypeRegistered,
-			Error: fmt.Sprintf("subdomain '%s' already in use", subdomain),
+			Error: fmt.Sprintf("subdomain '%s' already in use — pick another with --subdomain <label>", subdomain),
 		})
 		return
 	}

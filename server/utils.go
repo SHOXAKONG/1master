@@ -5,8 +5,33 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 )
+
+// subdomainLabelRe matches a user-requested label: 1–30 chars, lowercase
+// letters/digits/hyphens, not starting or ending with a hyphen.
+var subdomainLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?$`)
+
+// effectiveSubdomain maps an authenticated username and an optional requested
+// label to a public subdomain. With no label the tunnel lives at the bare
+// username (e.g. "alice"); a label is namespaced under the user as
+// "<label>-<username>" (e.g. "api-alice") so different users can never collide
+// and the single "*.<domain>" wildcard certificate still covers every result.
+func effectiveSubdomain(username, label string) (string, error) {
+	label = strings.ToLower(strings.TrimSpace(label))
+	if label == "" {
+		return username, nil
+	}
+	if !subdomainLabelRe.MatchString(label) {
+		return "", fmt.Errorf("must be 1-30 lowercase letters, digits or hyphens, not starting/ending with a hyphen")
+	}
+	full := label + "-" + username
+	if len(full) > 63 { // DNS label limit
+		return "", fmt.Errorf("resulting subdomain %q is too long", full)
+	}
+	return full, nil
+}
 
 // newConnID returns an unguessable hex connection id. It is unguessable on
 // purpose: the data port is shared by all tunnels, so a random id prevents one

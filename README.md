@@ -7,8 +7,10 @@ Expose your local server to the internet at a permanent
 
 - 1master is a free, self-hosted tunnel for exposing local servers to the
   public internet.
-- One subdomain per user. Forever yours — never changes across restarts,
-  reboots, or network swaps.
+- Your username is your default subdomain (`<username>.1master.uz`) — forever
+  yours, never changes across restarts, reboots, or network swaps.
+- Run many tunnels at once. Give each a custom subdomain with `--subdomain`;
+  it's published as `<label>-<username>.1master.uz`, so no two users collide.
 - Authenticated. Service tokens issued from the dashboard, validated on every
   registration.
 
@@ -69,7 +71,21 @@ Stored at `~/.1master/config.json` with `chmod 600`.
 ✅ Online: shohruh -> localhost:3000
 ```
 
-Your local service is now reachable at `http://<your-username>.1master.uz`.
+Your local service is now reachable at `https://<your-username>.1master.uz`.
+
+### 4. Run several tunnels at once
+
+Each tunnel is its own process (one per terminal). The first can use your bare
+username; give the others a `--subdomain` so they get distinct URLs:
+
+```bash
+1master http 8080                   # https://<username>.1master.uz
+1master http 3000 --subdomain web   # https://web-<username>.1master.uz
+1master http 9000 --subdomain api   # https://api-<username>.1master.uz
+```
+
+A subdomain label is 1–30 lowercase letters, digits or hyphens. They all share
+the same service token.
 
 Lost your token, or want to invalidate the running session? Rotate from the
 dashboard — old tokens stop working immediately.
@@ -88,9 +104,10 @@ dashboard — old tokens stop working immediately.
 
 | Flag       | Env              | Description                                                            |
 |------------|------------------|------------------------------------------------------------------------|
-| `--token`  | `MYTUNNEL_TOKEN` | Service token. Falls back to `~/.1master/config.json`.                 |
-| `--server` | —                | Tunnel server address. Default: `1master.uz:9000`.                     |
-| `--config` | —                | Path to JSON config file. Default: `~/.1master/config.json`.           |
+| `--token`     | `MYTUNNEL_TOKEN` | Service token. Falls back to `~/.1master/config.json`.              |
+| `--server`    | —                | Tunnel server address. Default: `1master.uz:9000`.                  |
+| `--subdomain` | —                | Custom subdomain label, published as `<label>-<username>`.          |
+| `--config`    | —                | Path to JSON config file. Default: `~/.1master/config.json`.        |
 
 Precedence for every value: **CLI flag → env var → config file → default**.
 

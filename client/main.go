@@ -117,18 +117,26 @@ USAGE:
   1master http <port> [flags]
 
 EXAMPLES:
-  1master http 8000
-  1master http 3000 --token YOUR_TOKEN
+  1master http 8000                       # -> https://<username>.1master.uz
+  1master http 3000 --subdomain web       # -> https://web-<username>.1master.uz
+  1master http 8080 --token YOUR_TOKEN
   1master http 8080 --server tunnel.1master.uz:9000
 
+  # Run several tunnels at once (each in its own terminal, one per port):
+  1master http 8080                        # api on <username>.1master.uz
+  1master http 3000 --subdomain web        # web on web-<username>.1master.uz
+
 FLAGS:
-  --token   <token>   Service token. Falls back to MYTUNNEL_TOKEN env var
-                      or ~/.1master/config.json.
-  --server  <addr>    Tunnel server address (default: 1master.uz:9000).
-  --config  <path>    Path to JSON config file (default: ~/.1master/config.json).
-  --tls               Dial the tunnel server over TLS (recommended in prod;
-                      can also be set with "tls": true in config.json).
-  --tls-skip-verify   Skip TLS certificate verification (self-signed servers).
+  --token     <token>   Service token. Falls back to MYTUNNEL_TOKEN env var
+                        or ~/.1master/config.json.
+  --server    <addr>    Tunnel server address (default: 1master.uz:9000).
+  --subdomain <label>   Custom subdomain label, published as <label>-<username>.
+                        Omit it for the first tunnel (uses <username>); required
+                        to distinguish additional tunnels running at the same time.
+  --config    <path>    Path to JSON config file (default: ~/.1master/config.json).
+  --tls                 Dial the tunnel server over TLS (recommended in prod;
+                        can also be set with "tls": true in config.json).
+  --tls-skip-verify     Skip TLS certificate verification (self-signed servers).
 
 COMMANDS:
   http       Start an HTTP tunnel for a local port.
@@ -148,6 +156,7 @@ func runHTTP(args []string) {
 	fs.Usage = func() { printUsage(os.Stderr) }
 	token := fs.String("token", "", "Service token (or set MYTUNNEL_TOKEN)")
 	serverAddr := fs.String("server", "", "Tunnel server address")
+	subdomain := fs.String("subdomain", "", "Requested subdomain label (published as <label>-<username>)")
 	configPath := fs.String("config", "", "Config file path (default ~/.1master/config.json)")
 	useTLS := fs.Bool("tls", false, "Dial the tunnel server over TLS")
 	tlsSkipVerify := fs.Bool("tls-skip-verify", false, "Skip TLS certificate verification (self-signed servers)")
@@ -189,6 +198,7 @@ Provide it via one of:
 	}
 
 	localAddr := fmt.Sprintf("localhost:%d", port)
+	resolvedSubdomain := strings.TrimSpace(*subdomain)
 
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════╗")
@@ -196,12 +206,16 @@ Provide it via one of:
 	fmt.Println("╠══════════════════════════════════════════════════╣")
 	fmt.Printf("║  Server:    %s\n", resolvedServer)
 	fmt.Printf("║  Forwards:  %s\n", localAddr)
-	fmt.Println("║  Subdomain: <your-username>.1master.uz           ║")
+	if resolvedSubdomain != "" {
+		fmt.Printf("║  Subdomain: %s-<username>.1master.uz\n", resolvedSubdomain)
+	} else {
+		fmt.Println("║  Subdomain: <username>.1master.uz")
+	}
 	fmt.Println("╚══════════════════════════════════════════════════╝")
 	fmt.Println()
 
 	for {
-		if err := runTunnel(resolvedServer, localAddr, resolvedToken, resolvedTLS); err != nil {
+		if err := runTunnel(resolvedServer, localAddr, resolvedToken, resolvedSubdomain, resolvedTLS); err != nil {
 			log.Printf("Connection lost: %v", err)
 			if isFatalAuthError(err) {
 				log.Printf("Auth error — not reconnecting.")
@@ -264,7 +278,7 @@ func dial(addr string, tlsCfg *tlsOptions) (net.Conn, error) {
 	})
 }
 
-func runTunnel(serverAddr, localAddr, token string, tlsCfg *tlsOptions) error {
+func runTunnel(serverAddr, localAddr, token, subdomain string, tlsCfg *tlsOptions) error {
 	log.Printf("Connecting to %s...", serverAddr)
 
 	rawConn, err := dial(serverAddr, tlsCfg)
@@ -274,7 +288,7 @@ func runTunnel(serverAddr, localAddr, token string, tlsCfg *tlsOptions) error {
 	defer rawConn.Close()
 
 	conn := protocol.NewSafeConn(rawConn)
-	if err := conn.Send(&protocol.Message{Type: protocol.TypeRegister, Token: token}); err != nil {
+	if err := conn.Send(&protocol.Message{Type: protocol.TypeRegister, Token: token, Subdomain: subdomain}); err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
 
