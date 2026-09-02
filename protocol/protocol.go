@@ -37,6 +37,8 @@ type Message struct {
 	Hostname  string `json:"hostname,omitempty"`  // registered: full public hostname
 	DataPort  string `json:"data_port,omitempty"` // registered: port the client dials per request
 	ConnID    string `json:"conn_id,omitempty"`   // new-conn: hex id to echo on the data connection
+	Method    string `json:"method,omitempty"`    // new-conn: HTTP method of the incoming request, for client-side logging
+	Path      string `json:"path,omitempty"`      // new-conn: HTTP path of the incoming request, for client-side logging
 	Error     string `json:"error,omitempty"`     // registered: non-empty means failure
 }
 

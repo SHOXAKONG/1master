@@ -5,33 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"regexp"
 	"strings"
 )
-
-// subdomainLabelRe matches a user-requested label: 1–30 chars, lowercase
-// letters/digits/hyphens, not starting or ending with a hyphen.
-var subdomainLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?$`)
-
-// effectiveSubdomain maps an authenticated username and an optional requested
-// label to a public subdomain. With no label the tunnel lives at the bare
-// username (e.g. "alice"); a label is namespaced under the user as
-// "<label>-<username>" (e.g. "api-alice") so different users can never collide
-// and the single "*.<domain>" wildcard certificate still covers every result.
-func effectiveSubdomain(username, label string) (string, error) {
-	label = strings.ToLower(strings.TrimSpace(label))
-	if label == "" {
-		return username, nil
-	}
-	if !subdomainLabelRe.MatchString(label) {
-		return "", fmt.Errorf("must be 1-30 lowercase letters, digits or hyphens, not starting/ending with a hyphen")
-	}
-	full := label + "-" + username
-	if len(full) > 63 { // DNS label limit
-		return "", fmt.Errorf("resulting subdomain %q is too long", full)
-	}
-	return full, nil
-}
 
 // newConnID returns an unguessable hex connection id. It is unguessable on
 // purpose: the data port is shared by all tunnels, so a random id prevents one
@@ -45,34 +20,52 @@ func newConnID() (string, error) {
 }
 
 // parseHost reads the start of an incoming HTTP request, extracts the Host
-// header, and returns it along with the bytes already consumed (so they can be
-// replayed to the client's local service). Adapted from jprq.
-func parseHost(r io.Reader) (string, []byte, error) {
+// header plus the request line's method and path (for the client's live
+// request log), and returns them along with the bytes already consumed (so
+// they can be replayed to the client's local service). Adapted from jprq.
+func parseHost(r io.Reader) (host, method, path string, initial []byte, err error) {
 	buffer := make([]byte, 2048)
-	size, err := r.Read(buffer)
+	size, readErr := r.Read(buffer)
 	buffer = buffer[:size]
-	if err != nil && size == 0 {
-		return "", buffer, err
+	if readErr != nil && size == 0 {
+		return "", "", "", buffer, readErr
 	}
 
 	text := string(buffer)
+	method, path = parseRequestLine(text)
+
 	left := strings.Index(text, "Host: ")
 	if left < 0 {
 		left = strings.Index(text, "host: ")
 	}
 	if left < 0 {
-		return "", buffer, fmt.Errorf("no host header found")
+		return "", "", "", buffer, fmt.Errorf("no host header found")
 	}
-	text = text[left+len("Host: "):]
-	right := strings.Index(text, "\n")
+	rest := text[left+len("Host: "):]
+	right := strings.Index(rest, "\n")
 	if right < 0 {
-		return "", buffer, fmt.Errorf("malformed host header")
+		return "", "", "", buffer, fmt.Errorf("malformed host header")
 	}
-	host := strings.TrimSpace(text[:right])
+	host = strings.TrimSpace(rest[:right])
 	if colon := strings.Index(host, ":"); colon != -1 {
 		host = host[:colon]
 	}
-	return strings.ToLower(host), buffer, nil
+	return strings.ToLower(host), method, path, buffer, nil
+}
+
+// parseRequestLine extracts the method and path from the first line of an
+// HTTP request (e.g. "GET /api/health HTTP/1.1"). Best-effort: used only for
+// the client's terminal request log, so a malformed line just yields "".
+func parseRequestLine(text string) (method, path string) {
+	end := strings.IndexAny(text, "\r\n")
+	if end < 0 {
+		end = len(text)
+	}
+	fields := strings.Fields(text[:end])
+	if len(fields) < 2 {
+		return "", ""
+	}
+	return fields[0], fields[1]
 }
 
 // subdomainOf returns everything before the first dot of host, or "".

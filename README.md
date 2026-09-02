@@ -7,10 +7,13 @@ Expose your local server to the internet at a permanent
 
 - 1master is a free, self-hosted tunnel for exposing local servers to the
   public internet.
-- Your username is your default subdomain (`<username>.1master.uz`) — forever
-  yours, never changes across restarts, reboots, or network swaps.
-- Run many tunnels at once. Give each a custom subdomain with `--subdomain`;
-  it's published as `<label>-<username>.1master.uz`, so no two users collide.
+- Reserve up to 5 subdomains on the [dashboard](https://1master.uz/dashboard)
+  — each name is globally unique and yours forever once claimed. Your
+  username is reserved automatically on signup.
+- Run several tunnels at once, from a single process and a single service
+  token — no `-<username>` suffix, the name you reserve is the name you get.
+- Every incoming request is printed live to your terminal (method + path) as
+  a lightweight built-in request log.
 - Authenticated. Service tokens issued from the dashboard, validated on every
   registration.
 
@@ -64,37 +67,38 @@ Stored at `~/.1master/config.json` with `chmod 600`.
 
 ```text
 🚇 1master Client
-  Server:    1master.uz:9000
-  Forwards:  localhost:3000
-  Subdomain: <your-username>.1master.uz
+  Server:   1master.uz:9000
+  Forward:  localhost:3000 -> (default)
 
-✅ Online: shohruh -> localhost:3000
+[:3000] ✅ online: https://shohruh.1master.uz -> localhost:3000
 ```
 
-Your local service is now reachable at `https://<your-username>.1master.uz`.
+Your local service is now reachable at `https://<your-subdomain>.1master.uz`.
+This only works for a subdomain you've already reserved on the dashboard —
+signing up reserves your username automatically.
 
 ### 4. Run several tunnels at once
 
-Each tunnel is its own process (one per terminal). The first can use your bare
-username; give the others a `--subdomain` so they get distinct URLs:
+One process, one service token, several reserved subdomains — no need for a
+terminal per tunnel:
 
 ```bash
-1master http 8080                   # https://<username>.1master.uz
-1master http 3000 --subdomain web   # https://web-<username>.1master.uz
-1master http 9000 --subdomain api   # https://api-<username>.1master.uz
+1master http web=3000 api=8000   # https://web.1master.uz + https://api.1master.uz
 ```
 
-A subdomain label is 1–30 lowercase letters, digits or hyphens. They all share
-the same service token.
+Prefer one at a time? `1master http <port> --subdomain <label>` still works —
+`<label>` must already be reserved. A subdomain label is 1–63 lowercase
+letters, digits or hyphens.
 
 Lost your token, or want to invalidate the running session? Rotate from the
 dashboard — old tokens stop working immediately.
 
 ## Commands
 
-| Command                | Description                                             |
-|------------------------|---------------------------------------------------------|
-| `1master http <port>`  | Expose a local HTTP port at `<username>.1master.uz`.    |
+| Command                          | Description                                             |
+|----------------------------------|-----------------------------------------------------------|
+| `1master http <port>`            | Expose a local HTTP port on your default reserved subdomain. |
+| `1master http <label>=<port> …`  | Expose one or more ports on specific reserved subdomains, at once. |
 | `1master auth <token>` | Save your service token to `~/.1master/config.json`.    |
 | `1master auth`         | Print whether you're authenticated (token is masked).   |
 | `1master version`      | Print the CLI version.                                  |
@@ -106,7 +110,7 @@ dashboard — old tokens stop working immediately.
 |------------|------------------|------------------------------------------------------------------------|
 | `--token`     | `MYTUNNEL_TOKEN` | Service token. Falls back to `~/.1master/config.json`.              |
 | `--server`    | —                | Tunnel server address. Default: `1master.uz:9000`.                  |
-| `--subdomain` | —                | Custom subdomain label, published as `<label>-<username>`.          |
+| `--subdomain` | —                | Reserved subdomain to use (single-tunnel form only).                |
 | `--config`    | —                | Path to JSON config file. Default: `~/.1master/config.json`.        |
 
 Precedence for every value: **CLI flag → env var → config file → default**.
@@ -132,7 +136,7 @@ Internet user                  VPS (1master.uz)               Your laptop
 ```
 
 1. **CLI** opens a long-lived TCP connection to the tunnel server, registers
-   under the authenticated user's username.
+   under one of the authenticated user's reserved subdomains.
 2. **Caddy** receives an HTTP request for `<username>.1master.uz`, forwards to
    the tunnel server.
 3. **Tunnel server** looks up the active subscription, serializes the request,

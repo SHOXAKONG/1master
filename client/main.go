@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mytunnel/protocol"
@@ -33,11 +34,18 @@ var defaultServer = "1master.uz:9000"
 
 const defaultConfigPath = "" // empty == don't read
 
-// Config is the persistent client configuration (single tunnel per token).
+// Config is the persistent client configuration.
 type Config struct {
 	Server string `json:"server,omitempty"`
 	Token  string `json:"token,omitempty"`
 	TLS    bool   `json:"tls,omitempty"`
+}
+
+// tunnelSpec is one local port to forward, and the reserved subdomain label
+// it should publish on ("" means "let the server pick my default").
+type tunnelSpec struct {
+	Label string
+	Port  int
 }
 
 func main() {
@@ -111,35 +119,39 @@ func runAuth(args []string) {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `1master — expose a local port at <username>.1master.uz
+	fmt.Fprint(w, `1master — expose local ports at subdomains you reserve in the dashboard
 
 USAGE:
-  1master http <port> [flags]
+  1master http <port>                       # your default reserved subdomain
+  1master http <label>=<port>               # a specific reserved subdomain
+  1master http <label>=<port> <label>=<port> ...   # several at once, one process
 
 EXAMPLES:
-  1master http 8000                       # -> https://<username>.1master.uz
-  1master http 3000 --subdomain web       # -> https://web-<username>.1master.uz
+  1master http 8000                       # -> https://<your default subdomain>.1master.uz
+  1master http web=3000                   # -> https://web.1master.uz (must be reserved first)
+  1master http web=3000 api=8000          # two tunnels at once, one auth
   1master http 8080 --token YOUR_TOKEN
   1master http 8080 --server tunnel.1master.uz:9000
 
-  # Run several tunnels at once (each in its own terminal, one per port):
-  1master http 8080                        # api on <username>.1master.uz
-  1master http 3000 --subdomain web        # web on web-<username>.1master.uz
+  Reserve subdomains (up to 5, unique) at https://1master.uz/dashboard before
+  using them here — the server rejects any label you haven't reserved.
 
 FLAGS:
   --token     <token>   Service token. Falls back to MYTUNNEL_TOKEN env var
                         or ~/.1master/config.json.
   --server    <addr>    Tunnel server address (default: 1master.uz:9000).
-  --subdomain <label>   Custom subdomain label, published as <label>-<username>.
-                        Omit it for the first tunnel (uses <username>); required
-                        to distinguish additional tunnels running at the same time.
+  --subdomain <label>   Reserved subdomain to use (single-tunnel form only;
+                        for several at once use "<label>=<port>" instead).
   --config    <path>    Path to JSON config file (default: ~/.1master/config.json).
   --tls                 Dial the tunnel server over TLS (recommended in prod;
                         can also be set with "tls": true in config.json).
   --tls-skip-verify     Skip TLS certificate verification (self-signed servers).
 
+  Every request that arrives is printed live to the terminal (method + path)
+  as a lightweight event stream, per tunnel — no extra flag needed.
+
 COMMANDS:
-  http       Start an HTTP tunnel for a local port.
+  http       Start one or more HTTP tunnels for local ports.
   auth       Save your service token to ~/.1master/config.json.
   version    Print client version.
   help       Show this message.
@@ -151,28 +163,91 @@ func printUsageAndExit() {
 	os.Exit(2)
 }
 
+// parseTunnelSpecs turns the positional args after "http" into tunnelSpecs.
+// A single bare port is the legacy single-tunnel form (subdomain comes from
+// --subdomain / the account default). Two or more args, or any arg
+// containing "=", switches to multi-tunnel mode where every arg must be
+// "<label>=<port>" so each tunnel's subdomain is unambiguous.
+func parseTunnelSpecs(args []string, flagSubdomain string) ([]tunnelSpec, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("missing port. Usage: 1master http <port>")
+	}
+
+	multi := len(args) > 1
+	for _, a := range args {
+		if strings.Contains(a, "=") {
+			multi = true
+		}
+	}
+
+	if !multi {
+		port, err := parsePort(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return []tunnelSpec{{Label: strings.TrimSpace(flagSubdomain), Port: port}}, nil
+	}
+
+	if flagSubdomain != "" {
+		return nil, fmt.Errorf("--subdomain can't be combined with multiple tunnels; use \"<label>=<port>\" for each instead")
+	}
+
+	specs := make([]tunnelSpec, 0, len(args))
+	seen := make(map[string]bool, len(args))
+	for _, a := range args {
+		label, portStr, ok := strings.Cut(a, "=")
+		if !ok || label == "" || portStr == "" {
+			return nil, fmt.Errorf("invalid tunnel %q — multi-tunnel args must look like \"<label>=<port>\", e.g. \"web=3000\"", a)
+		}
+		port, err := parsePort(portStr)
+		if err != nil {
+			return nil, err
+		}
+		label = strings.ToLower(strings.TrimSpace(label))
+		if seen[label] {
+			return nil, fmt.Errorf("duplicate subdomain %q", label)
+		}
+		seen[label] = true
+		specs = append(specs, tunnelSpec{Label: label, Port: port})
+	}
+	return specs, nil
+}
+
+func parsePort(s string) (int, error) {
+	port, err := strconv.Atoi(s)
+	if err != nil || port <= 0 || port > 65535 {
+		return 0, fmt.Errorf("invalid port %q — must be 1–65535", s)
+	}
+	return port, nil
+}
+
 func runHTTP(args []string) {
 	fs := flag.NewFlagSet("http", flag.ExitOnError)
 	fs.Usage = func() { printUsage(os.Stderr) }
 	token := fs.String("token", "", "Service token (or set MYTUNNEL_TOKEN)")
 	serverAddr := fs.String("server", "", "Tunnel server address")
-	subdomain := fs.String("subdomain", "", "Requested subdomain label (published as <label>-<username>)")
+	subdomain := fs.String("subdomain", "", "Reserved subdomain to use (single-tunnel form only)")
 	configPath := fs.String("config", "", "Config file path (default ~/.1master/config.json)")
 	useTLS := fs.Bool("tls", false, "Dial the tunnel server over TLS")
 	tlsSkipVerify := fs.Bool("tls-skip-verify", false, "Skip TLS certificate verification (self-signed servers)")
 
-	// Positional port must come before flags (ngrok-style): `1master http 8000 --token X`.
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "❌ Missing port. Usage: 1master http <port>")
+	// Positional ports/specs must come before flags (ngrok-style):
+	// `1master http 8000 --token X` or `1master http web=3000 api=8000 --token X`.
+	splitAt := len(args)
+	for i, a := range args {
+		if strings.HasPrefix(a, "-") {
+			splitAt = i
+			break
+		}
+	}
+	positional, flagArgs := args[:splitAt], args[splitAt:]
+	if err := fs.Parse(flagArgs); err != nil {
 		os.Exit(2)
 	}
-	portArg := args[0]
-	port, err := strconv.Atoi(portArg)
-	if err != nil || port <= 0 || port > 65535 {
-		fmt.Fprintf(os.Stderr, "❌ Invalid port %q. Must be 1–65535.\n", portArg)
-		os.Exit(2)
-	}
-	if err := fs.Parse(args[1:]); err != nil {
+
+	specs, err := parseTunnelSpecs(positional, *subdomain)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(2)
 	}
 
@@ -197,31 +272,50 @@ Provide it via one of:
 		os.Exit(2)
 	}
 
-	localAddr := fmt.Sprintf("localhost:%d", port)
-	resolvedSubdomain := strings.TrimSpace(*subdomain)
-
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════╗")
 	fmt.Println("║              🚇 1master Client                  ║")
 	fmt.Println("╠══════════════════════════════════════════════════╣")
-	fmt.Printf("║  Server:    %s\n", resolvedServer)
-	fmt.Printf("║  Forwards:  %s\n", localAddr)
-	if resolvedSubdomain != "" {
-		fmt.Printf("║  Subdomain: %s-<username>.1master.uz\n", resolvedSubdomain)
-	} else {
-		fmt.Println("║  Subdomain: <username>.1master.uz")
+	fmt.Printf("║  Server:  %s\n", resolvedServer)
+	for _, spec := range specs {
+		label := spec.Label
+		if label == "" {
+			label = "(default)"
+		}
+		fmt.Printf("║  Forward: localhost:%-6d -> %s\n", spec.Port, label)
 	}
 	fmt.Println("╚══════════════════════════════════════════════════╝")
 	fmt.Println()
 
+	var wg sync.WaitGroup
+	for _, spec := range specs {
+		wg.Add(1)
+		go func(spec tunnelSpec) {
+			defer wg.Done()
+			runTunnelWithRetry(resolvedServer, spec, resolvedToken, resolvedTLS)
+		}(spec)
+	}
+	wg.Wait()
+}
+
+// runTunnelWithRetry keeps one tunnel connected, reconnecting on transient
+// errors, until a fatal auth error ends it for good. Each tunnel spec gets
+// its own independent retry loop, so one dying doesn't affect the others.
+func runTunnelWithRetry(serverAddr string, spec tunnelSpec, token string, tlsCfg *tlsOptions) {
+	localAddr := fmt.Sprintf("localhost:%d", spec.Port)
+	logLabel := spec.Label
+	if logLabel == "" {
+		logLabel = fmt.Sprintf(":%d", spec.Port)
+	}
+
 	for {
-		if err := runTunnel(resolvedServer, localAddr, resolvedToken, resolvedSubdomain, resolvedTLS); err != nil {
-			log.Printf("Connection lost: %v", err)
+		if err := runTunnel(serverAddr, localAddr, token, spec.Label, logLabel, tlsCfg); err != nil {
+			log.Printf("[%s] connection lost: %v", logLabel, err)
 			if isFatalAuthError(err) {
-				log.Printf("Auth error — not reconnecting.")
+				log.Printf("[%s] auth error — not reconnecting.", logLabel)
 				return
 			}
-			log.Printf("Reconnecting in 3 seconds...")
+			log.Printf("[%s] reconnecting in 3 seconds...", logLabel)
 			time.Sleep(3 * time.Second)
 		}
 	}
@@ -278,8 +372,8 @@ func dial(addr string, tlsCfg *tlsOptions) (net.Conn, error) {
 	})
 }
 
-func runTunnel(serverAddr, localAddr, token, subdomain string, tlsCfg *tlsOptions) error {
-	log.Printf("Connecting to %s...", serverAddr)
+func runTunnel(serverAddr, localAddr, token, subdomain, logLabel string, tlsCfg *tlsOptions) error {
+	log.Printf("[%s] connecting to %s...", logLabel, serverAddr)
 
 	rawConn, err := dial(serverAddr, tlsCfg)
 	if err != nil {
@@ -307,7 +401,7 @@ func runTunnel(serverAddr, localAddr, token, subdomain string, tlsCfg *tlsOption
 	}
 	dataAddr := net.JoinHostPort(host, resp.DataPort)
 
-	log.Printf("✅ Online: https://%s -> %s", resp.Hostname, localAddr)
+	log.Printf("[%s] ✅ online: https://%s -> %s", logLabel, resp.Hostname, localAddr)
 
 	for {
 		msg, err := protocol.Recv(conn)
@@ -315,9 +409,19 @@ func runTunnel(serverAddr, localAddr, token, subdomain string, tlsCfg *tlsOption
 			return fmt.Errorf("recv: %w", err)
 		}
 		if msg.Type == protocol.TypeNewConn {
+			// Live request event stream: print the instant a request arrives,
+			// before we even dial the local service.
+			log.Printf("[%s] %s %s", logLabel, orDash(msg.Method), orDash(msg.Path))
 			go handleConn(dataAddr, localAddr, msg.ConnID, tlsCfg)
 		}
 	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // handleConn services one public request: it dials the local service and a

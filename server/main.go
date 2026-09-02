@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,11 +65,42 @@ func NewServer(domain, dataPort, authURL string) *Server {
 
 // authResponse mirrors the backend's TunnelAuthResponse.
 type authResponse struct {
-	UserID    string `json:"user_id"`
-	Email     string `json:"email"`
-	Username  string `json:"username"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
+	UserID     string   `json:"user_id"`
+	Email      string   `json:"email"`
+	Username   string   `json:"username"`
+	FirstName  string   `json:"first_name"`
+	LastName   string   `json:"last_name"`
+	Subdomains []string `json:"subdomains"`
+}
+
+// resolveSubdomain picks the subdomain a newly-registering client will
+// publish on, enforcing that it's one the authenticated user actually
+// reserved in the dashboard. An empty requested label defaults to the
+// user's username if reserved, else their first reserved subdomain.
+func resolveSubdomain(auth *authResponse, requested string) (string, error) {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if len(auth.Subdomains) == 0 {
+		return "", fmt.Errorf("no subdomains reserved — create one at https://1master.uz/dashboard")
+	}
+
+	if requested == "" {
+		for _, s := range auth.Subdomains {
+			if s == auth.Username {
+				return s, nil
+			}
+		}
+		return auth.Subdomains[0], nil
+	}
+
+	for _, s := range auth.Subdomains {
+		if s == requested {
+			return s, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"subdomain %q is not reserved on your account — create it at https://1master.uz/dashboard first",
+		requested,
+	)
 }
 
 // verifyToken validates a service token against the backend.
@@ -144,13 +176,14 @@ func (s *Server) handleControlConn(rawConn net.Conn) {
 		return
 	}
 
-	// A user may run several tunnels at once; each gets its own subdomain.
-	// No requested label -> the bare username; a label -> "<label>-<username>".
-	subdomain, err := effectiveSubdomain(username, msg.Subdomain)
+	// A user may run several tunnels at once, each on a subdomain they
+	// reserved in the dashboard beforehand (backend enforces the max-5 cap
+	// and global uniqueness; this just checks ownership of the request).
+	subdomain, err := resolveSubdomain(auth, msg.Subdomain)
 	if err != nil {
 		conn.Send(&protocol.Message{
 			Type:  protocol.TypeRegistered,
-			Error: "invalid subdomain: " + err.Error(),
+			Error: err.Error(),
 		})
 		return
 	}
@@ -162,7 +195,7 @@ func (s *Server) handleControlConn(rawConn net.Conn) {
 		s.mu.Unlock()
 		conn.Send(&protocol.Message{
 			Type:  protocol.TypeRegistered,
-			Error: fmt.Sprintf("subdomain '%s' already in use — pick another with --subdomain <label>", subdomain),
+			Error: fmt.Sprintf("subdomain '%s' is already connected from elsewhere — disconnect it first or use another reserved subdomain", subdomain),
 		})
 		return
 	}
@@ -221,7 +254,7 @@ func (s *Server) dropTunnel(t *Tunnel) {
 // the matching tunnel, parks the connection, and asks the client to dial back.
 func (s *Server) servePublicConn(pub net.Conn) {
 	_ = pub.SetReadDeadline(time.Now().Add(pendingConnTTL))
-	host, initial, err := parseHost(pub)
+	host, method, path, initial, err := parseHost(pub)
 	if err != nil || host == "" {
 		writeHTTPError(pub, http.StatusBadRequest, "Bad Request", "could not determine target host")
 		return
@@ -259,7 +292,7 @@ func (s *Server) servePublicConn(pub net.Conn) {
 		}
 	})
 
-	if err := tunnel.control.Send(&protocol.Message{Type: protocol.TypeNewConn, ConnID: id}); err != nil {
+	if err := tunnel.control.Send(&protocol.Message{Type: protocol.TypeNewConn, ConnID: id, Method: method, Path: path}); err != nil {
 		if p := s.takePending(id); p != nil {
 			writeHTTPError(p.pub, http.StatusBadGateway, "Bad Gateway", "tunnel client unavailable")
 		}
