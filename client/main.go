@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +18,12 @@ import (
 
 	"mytunnel/protocol"
 )
+
+// errKicked means a newer connection took over this subdomain (most likely
+// this same client reconnecting from another terminal or after a crash).
+// It is terminal: reconnecting would just race the new connection to
+// preempt it right back.
+var errKicked = errors.New("kicked: another connection took over this subdomain")
 
 // tlsOptions controls whether the client dials the tunnel server over TLS.
 type tlsOptions struct {
@@ -315,6 +322,10 @@ func runTunnelWithRetry(serverAddr string, spec tunnelSpec, token string, tlsCfg
 				log.Printf("[%s] auth error — not reconnecting.", logLabel)
 				return
 			}
+			if errors.Is(err, errKicked) {
+				log.Printf("[%s] another connection took over this subdomain — not reconnecting.", logLabel)
+				return
+			}
 			log.Printf("[%s] reconnecting in 3 seconds...", logLabel)
 			time.Sleep(3 * time.Second)
 		}
@@ -403,16 +414,42 @@ func runTunnel(serverAddr, localAddr, token, subdomain, logLabel string, tlsCfg 
 
 	log.Printf("[%s] ✅ online: https://%s -> %s", logLabel, resp.Hostname, localAddr)
 
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go sendHeartbeats(conn, stopPing)
+
 	for {
 		msg, err := protocol.Recv(conn)
 		if err != nil {
 			return fmt.Errorf("recv: %w", err)
 		}
-		if msg.Type == protocol.TypeNewConn {
+		switch msg.Type {
+		case protocol.TypeNewConn:
 			// Live request event stream: print the instant a request arrives,
 			// before we even dial the local service.
 			log.Printf("[%s] %s %s", logLabel, orDash(msg.Method), orDash(msg.Path))
 			go handleConn(dataAddr, localAddr, msg.ConnID, tlsCfg)
+		case protocol.TypeKicked:
+			return errKicked
+		}
+	}
+}
+
+// sendHeartbeats periodically pings the control connection so the server
+// knows this client is still alive; see protocol.ControlIdleTimeout. It
+// self-terminates the moment a send fails (the connection is dead anyway,
+// runTunnel's own Recv will notice next) or stop is closed.
+func sendHeartbeats(conn *protocol.SafeConn, stop <-chan struct{}) {
+	ticker := time.NewTicker(protocol.PingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if err := conn.Send(&protocol.Message{Type: protocol.TypePing}); err != nil {
+				return
+			}
 		}
 	}
 }

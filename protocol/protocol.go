@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // Control-channel message types.
@@ -23,6 +24,20 @@ const (
 	TypeRegister   uint8 = 1 // client -> server: authenticate and open a tunnel
 	TypeRegistered uint8 = 2 // server -> client: tunnel is open (or Error set)
 	TypeNewConn    uint8 = 3 // server -> client: a public connection is waiting
+	TypePing       uint8 = 4 // client -> server: heartbeat, proves the client is still alive
+	TypeKicked     uint8 = 5 // server -> client: a newer connection took over this subdomain; do not reconnect
+)
+
+// PingInterval is how often a registered client sends TypePing on the
+// control channel. ControlIdleTimeout is how long the server waits without
+// receiving anything before treating the connection as dead — kept a
+// generous multiple of PingInterval so ordinary network jitter (a slow
+// wifi handoff, a laptop briefly waking from sleep) doesn't trip it, while
+// a genuinely crashed client or severed connection is still reclaimed in
+// well under a minute instead of holding its subdomain forever.
+const (
+	PingInterval       = 20 * time.Second
+	ControlIdleTimeout = 60 * time.Second
 )
 
 // ConnIDSize is the number of raw bytes a client writes on a data connection to

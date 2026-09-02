@@ -190,17 +190,26 @@ func (s *Server) handleControlConn(rawConn net.Conn) {
 
 	tunnel := &Tunnel{Subdomain: subdomain, UserEmail: auth.Email, control: conn}
 
+	// A subdomain can only ever be occupied by its owner (resolveSubdomain
+	// already checked that above), so a second connection for the same name
+	// is always the same user reconnecting — most commonly after a crash, a
+	// force-quit, or a laptop sleep/wake that left the old connection
+	// half-open. Preempt it rather than locking the user out of their own
+	// subdomain until the stale connection eventually times out on its own.
 	s.mu.Lock()
-	if _, exists := s.tunnels[subdomain]; exists {
-		s.mu.Unlock()
-		conn.Send(&protocol.Message{
-			Type:  protocol.TypeRegistered,
-			Error: fmt.Sprintf("subdomain '%s' is already connected from elsewhere — disconnect it first or use another reserved subdomain", subdomain),
-		})
-		return
-	}
+	old, existed := s.tunnels[subdomain]
 	s.tunnels[subdomain] = tunnel
 	s.mu.Unlock()
+	if existed {
+		log.Printf("[control] preempting stale connection for %s (user=%s)", subdomain, auth.Email)
+		// Best-effort courtesy notice so a still-live old client doesn't just
+		// see a bare connection error and blindly retry (which would race to
+		// preempt us right back). Bounded so a genuinely dead peer — the
+		// common case — can't stall this new connection's registration.
+		_ = old.control.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		old.control.Send(&protocol.Message{Type: protocol.TypeKicked})
+		old.control.Close()
+	}
 
 	hostname := fmt.Sprintf("%s.%s", subdomain, s.domain)
 	if err := conn.Send(&protocol.Message{
@@ -220,9 +229,13 @@ func (s *Server) handleControlConn(rawConn net.Conn) {
 		log.Printf("[control] disconnected: %s (user=%s)", subdomain, auth.Email)
 	}()
 
-	// The client never sends more control frames; this blocks until the
-	// connection closes, acting as a disconnect detector.
+	// The client periodically sends TypePing as a heartbeat; anything else it
+	// might send is ignored. Renewing the read deadline on every message
+	// means a client that goes silent — crashed, force-quit, network
+	// severed without a clean TCP close — is reclaimed within
+	// ControlIdleTimeout instead of holding its subdomain forever.
 	for {
+		_ = rawConn.SetReadDeadline(time.Now().Add(protocol.ControlIdleTimeout))
 		if _, err := protocol.Recv(conn); err != nil {
 			return
 		}
